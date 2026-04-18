@@ -42,6 +42,14 @@ public class LogicalTypeReader {
                         reader.skipField(header.type()); // Empty struct
                         yield new LogicalType.StringType();
                     }
+                    case 2 -> { // MAP
+                        reader.skipField(header.type()); // Empty struct
+                        yield new LogicalType.MapType();
+                    }
+                    case 3 -> { // LIST
+                        reader.skipField(header.type()); // Empty struct
+                        yield new LogicalType.ListType();
+                    }
                     case 4 -> { // ENUM
                         reader.skipField(header.type()); // Empty struct
                         yield new LogicalType.EnumType();
