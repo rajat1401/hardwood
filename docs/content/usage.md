@@ -154,6 +154,8 @@ All accessor methods are available in two forms:
 
 All methods are available as both `method(name)` and `method(index)`, except `getStruct`, `getList`, and `getMap` which are name-based only.
 
+**Bare `BYTE_ARRAY` columns:** `BYTE_ARRAY` columns without a `STRING` logical type annotation may hold arbitrary binary payloads (Protobuf, WKB, custom encodings). Generic accessors such as `PqList.get` and `PqList.iterator` surface these as `byte[]` rather than silently UTF-8 decoding them — invalid byte sequences would otherwise be replaced with `U+FFFD`. Call `getString` explicitly when the column is known to contain UTF-8 text from an older writer that omitted the `STRING` annotation.
+
 **Legacy INT96 timestamps:** Parquet files written by older versions of Apache Spark and Hive store timestamps in the deprecated INT96 physical type without a TIMESTAMP logical type annotation. `getTimestamp` detects INT96 automatically and decodes it to an `Instant`; no caller-side handling is required.
 
 **Index-based access example:**
@@ -290,7 +292,7 @@ A row limit instructs the reader to stop after the specified number of rows, avo
 ```java
 // Read at most 100 rows
 try (ParquetFileReader fileReader = ParquetFileReader.open(InputFile.of(path));
-     RowReader rowReader = fileReader.createRowReader(100)) {
+     RowReader rowReader = fileReader.createRowReader(ColumnProjection.all(), null, 100)) {
 
     while (rowReader.hasNext()) {
         rowReader.next();

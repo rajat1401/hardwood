@@ -10,13 +10,16 @@ package dev.hardwood.cli.internal.table;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
-
-import com.github.freva.asciitable.AsciiTable;
 
 import dev.hardwood.internal.conversion.LogicalTypeConverter;
 import dev.hardwood.metadata.LogicalType;
@@ -56,26 +59,39 @@ public final class RowTable {
     }
 
     public static String renderField(RowReader rowReader, int fieldIndex, SchemaNode fieldSchema) {
-        if (isStringField(fieldSchema)) {
+        if (isAnnotatedStringField(fieldSchema)) {
             String s = rowReader.getString(fieldIndex);
             return s != null ? s : "null";
         }
         return renderValue(rowReader.getValue(fieldIndex), fieldSchema);
     }
 
-    private static boolean isStringField(SchemaNode node) {
+    private static boolean isAnnotatedStringField(SchemaNode node) {
         if (!(node instanceof SchemaNode.PrimitiveNode pn)) {
             return false;
         }
         LogicalType lt = pn.logicalType();
-        if (lt instanceof LogicalType.StringType
+        return lt instanceof LogicalType.StringType
                 || lt instanceof LogicalType.EnumType
-                || lt instanceof LogicalType.JsonType) {
+                || lt instanceof LogicalType.JsonType;
+    }
+
+    private static boolean isBareByteArray(SchemaNode node) {
+        return node instanceof SchemaNode.PrimitiveNode pn
+                && pn.type() == PhysicalType.BYTE_ARRAY
+                && pn.logicalType() == null;
+    }
+
+    private static boolean isValidUtf8(byte[] bytes) {
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        try {
+            decoder.decode(ByteBuffer.wrap(bytes));
             return true;
+        } catch (CharacterCodingException e) {
+            return false;
         }
-        // BYTE_ARRAY with no logical type is treated as a string, consistent with
-        // ValueConverter.convertValue() fallback behavior.
-        return lt == null && pn.type() == PhysicalType.BYTE_ARRAY;
     }
 
     public static String renderValue(Object value, SchemaNode schema) {
@@ -109,8 +125,17 @@ public final class RowTable {
     }
 
     private static String renderBytes(byte[] bytes, SchemaNode schema) {
-        if (isStringField(schema)) {
+        if (isAnnotatedStringField(schema)) {
             return new String(bytes, StandardCharsets.UTF_8);
+        }
+        if (isBareByteArray(schema)) {
+            // Schema omits the STRING annotation, so we can't trust the column to
+            // be text. Opportunistically decode when the bytes are valid UTF-8 (the
+            // common case for older writers) and summarise otherwise, so binary
+            // payloads aren't silently rendered with U+FFFD replacement characters.
+            return isValidUtf8(bytes)
+                    ? new String(bytes, StandardCharsets.UTF_8)
+                    : "<" + bytes.length + " bytes>";
         }
         if (!(schema instanceof SchemaNode.PrimitiveNode pn)) {
             return "<" + bytes.length + " bytes>";
@@ -196,7 +221,121 @@ public final class RowTable {
     }
 
     public static String renderTable(String[] headers, List<String[]> rows) {
-        Object[][] data = rows.toArray(new String[0][]);
-        return AsciiTable.getTable(AsciiTable.BASIC_ASCII_NO_DATA_SEPARATORS, headers, null, data);
+        return renderTable(headers, rows, Collections.emptyList(), Collections.emptyList());
+    }
+
+    /// Renders a table like [renderTable(String[], List)], but inserts a horizontal
+    /// border line before each row whose index appears in `separatorsBefore`. Indices
+    /// refer to positions within `rows` (0 = first data row). Rows listed in
+    /// `heavySeparatorsBefore` get a heavier separator (`=` instead of `-`) to visually
+    /// distinguish summary sections such as totals.
+    ///
+    /// Column widths are computed from terminal display width so that East Asian
+    /// wide characters (CJK, Hangul, Kana, Fullwidth forms) contribute 2 cells each,
+    /// keeping alignment correct across rows that mix Latin and wide-character text.
+    public static String renderTable(String[] headers, List<String[]> rows,
+                                     List<Integer> separatorsBefore,
+                                     List<Integer> heavySeparatorsBefore) {
+        int cols = headers.length;
+        int[] widths = new int[cols];
+        for (int i = 0; i < cols; i++) {
+            widths[i] = displayWidth(headers[i]);
+        }
+        for (String[] row : rows) {
+            for (int i = 0; i < cols; i++) {
+                widths[i] = Math.max(widths[i], displayWidth(row[i]));
+            }
+        }
+
+        String lightBorder = buildBorder(widths, '-');
+        String heavyBorder = buildBorder(widths, '=');
+        Set<Integer> lightSet = new HashSet<>(separatorsBefore);
+        Set<Integer> heavySet = new HashSet<>(heavySeparatorsBefore);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(lightBorder).append('\n');
+        sb.append(renderCells(headers, widths, false)).append('\n');
+        sb.append(lightBorder).append('\n');
+        for (int r = 0; r < rows.size(); r++) {
+            if (heavySet.contains(r)) {
+                sb.append(heavyBorder).append('\n');
+            }
+            else if (lightSet.contains(r)) {
+                sb.append(lightBorder).append('\n');
+            }
+            sb.append(renderCells(rows.get(r), widths, true)).append('\n');
+        }
+        sb.append(lightBorder);
+        return sb.toString();
+    }
+
+    private static String buildBorder(int[] widths, char fill) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('+');
+        for (int w : widths) {
+            for (int i = 0; i < w + 2; i++) {
+                sb.append(fill);
+            }
+            sb.append('+');
+        }
+        return sb.toString();
+    }
+
+    private static String renderCells(String[] cells, int[] widths, boolean rightAlign) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('|');
+        for (int i = 0; i < cells.length; i++) {
+            String cell = cells[i];
+            int padding = widths[i] - displayWidth(cell);
+            sb.append(' ');
+            if (rightAlign) {
+                appendSpaces(sb, padding);
+                sb.append(cell);
+            }
+            else {
+                sb.append(cell);
+                appendSpaces(sb, padding);
+            }
+            sb.append(' ');
+            sb.append('|');
+        }
+        return sb.toString();
+    }
+
+    private static void appendSpaces(StringBuilder sb, int count) {
+        for (int i = 0; i < count; i++) {
+            sb.append(' ');
+        }
+    }
+
+    /// Returns the number of terminal cells the string occupies. East Asian wide
+    /// characters (CJK ideographs, Hangul, Kana, Fullwidth forms) count as 2; other
+    /// characters count as 1. Surrogate pairs are counted once per code point.
+    static int displayWidth(String s) {
+        int width = 0;
+        int i = 0;
+        int len = s.length();
+        while (i < len) {
+            int cp = s.codePointAt(i);
+            width += isWideCodePoint(cp) ? 2 : 1;
+            i += Character.charCount(cp);
+        }
+        return width;
+    }
+
+    private static boolean isWideCodePoint(int cp) {
+        return (cp >= 0x1100 && cp <= 0x115F)     // Hangul Jamo
+                || (cp >= 0x2E80 && cp <= 0x303E) // CJK Radicals, Kangxi, CJK Symbols & Punctuation
+                || (cp >= 0x3041 && cp <= 0x33FF) // Hiragana, Katakana, Bopomofo, Hangul Compat, CJK Strokes
+                || (cp >= 0x3400 && cp <= 0x4DBF) // CJK Unified Ideographs Extension A
+                || (cp >= 0x4E00 && cp <= 0x9FFF) // CJK Unified Ideographs
+                || (cp >= 0xA000 && cp <= 0xA4CF) // Yi Syllables & Radicals
+                || (cp >= 0xAC00 && cp <= 0xD7A3) // Hangul Syllables
+                || (cp >= 0xF900 && cp <= 0xFAFF) // CJK Compatibility Ideographs
+                || (cp >= 0xFE30 && cp <= 0xFE4F) // CJK Compatibility Forms
+                || (cp >= 0xFF00 && cp <= 0xFF60) // Fullwidth Forms
+                || (cp >= 0xFFE0 && cp <= 0xFFE6) // Fullwidth Signs
+                || (cp >= 0x20000 && cp <= 0x2FFFD) // CJK Extensions B–F
+                || (cp >= 0x30000 && cp <= 0x3FFFD); // CJK Extension G
     }
 }
